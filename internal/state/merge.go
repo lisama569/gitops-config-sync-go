@@ -80,7 +80,8 @@ func resolve(resource, field string, cands []candidate) (string, error) {
 	return winners[0].canonical, nil
 }
 
-// canonicalField 校验字段类型并给出规范化字符串表示；类型不合法时返回 *RejectError。
+// canonicalField 校验标量字段（dependsOn / replicas）类型并给出规范化字符串表示；
+// 类型不合法时返回 *RejectError。config 不按整字段处理，见 canonicalConfig。
 func canonicalField(src Source, resource, field string, raw any) (string, error) {
 	bad := func(detail string) (string, error) {
 		return "", &RejectError{
@@ -116,28 +117,41 @@ func canonicalField(src Source, resource, field string, raw any) (string, error)
 			return bad("replicas must be a non-negative integer")
 		}
 		return strconv.FormatInt(n, 10), nil
-	case "config":
-		obj, ok := raw.(map[string]any)
-		if !ok {
-			return bad("config must be an object of string values")
-		}
-		pairs := make([]string, 0, len(obj))
-		for k, v := range obj {
-			s, ok := v.(string)
-			if !ok {
-				return bad(fmt.Sprintf("config.%s must be a string", k))
-			}
-			pairs = append(pairs, k+"="+s)
-		}
-		sort.Strings(pairs)
-		return strings.Join(pairs, "\n"), nil
 	default:
 		return bad("unknown field " + strconv.Quote(field))
 	}
 }
 
+// canonicalConfig 校验 config 字段类型（字符串字典）并返回键值副本；
+// 类型不合法时返回 *RejectError。config 以键为最小单位参与合并。
+func canonicalConfig(src Source, resource string, raw any) (map[string]string, error) {
+	bad := func(detail string) (map[string]string, error) {
+		return nil, &RejectError{
+			Reason: ReasonInvalidFieldType,
+			Source: src.Name,
+			Field:  resource + ".config",
+			Detail: detail,
+		}
+	}
+	obj, ok := raw.(map[string]any)
+	if !ok {
+		return bad("config must be an object of string values")
+	}
+	out := make(map[string]string, len(obj))
+	for k, v := range obj {
+		s, ok := v.(string)
+		if !ok {
+			return bad(fmt.Sprintf("config.%s must be a string", k))
+		}
+		out[k] = s
+	}
+	return out, nil
+}
+
 // Merge 按优先级合并多个来源。
-// 同一字段被同优先级来源赋予不同值时返回 *RejectError{Reason: ReasonConflictingOverride}；
+// 标量字段（dependsOn / replicas）以整字段为单位、config 以单个键为最小单位叠加：
+// 高优先级来源只覆盖它显式设置的（字段 / config 键），未触及的部分从低优先级来源原样保留。
+// 同一（字段 / config 键）被同优先级来源赋予不同值时返回 *RejectError{Reason: ReasonConflictingOverride}；
 // 字段类型不合法时返回 *RejectError{Reason: ReasonInvalidFieldType}。
 func Merge(sources []Source) (map[string]Resource, error) {
 	names := map[string]struct{}{}
@@ -154,8 +168,9 @@ func Merge(sources []Source) (map[string]Resource, error) {
 
 	merged := make(map[string]Resource, len(sorted))
 	for _, name := range sorted {
-		// 按字段收集各来源候选值。
+		// 按字段收集各来源候选值；config 按键收集。
 		perField := map[string][]candidate{}
+		perConfigKey := map[string][]candidate{}
 		for _, src := range sources {
 			raw, ok := src.Resources[name]
 			if !ok {
@@ -167,6 +182,25 @@ func Merge(sources []Source) (map[string]Resource, error) {
 			}
 			sort.Strings(keys)
 			for _, field := range keys {
+				if field == "config" {
+					kv, err := canonicalConfig(src, name, raw[field])
+					if err != nil {
+						return nil, err
+					}
+					ck := make([]string, 0, len(kv))
+					for k := range kv {
+						ck = append(ck, k)
+					}
+					sort.Strings(ck)
+					for _, k := range ck {
+						perConfigKey[k] = append(perConfigKey[k], candidate{
+							canonical: kv[k],
+							source:    src.Name,
+							priority:  src.Priority,
+						})
+					}
+					continue
+				}
 				canon, err := canonicalField(src, name, field, raw[field])
 				if err != nil {
 					return nil, err
@@ -197,18 +231,19 @@ func Merge(sources []Source) (map[string]Resource, error) {
 			n, _ := strconv.Atoi(v)
 			res.Replicas = n
 		}
-		if cands, ok := perField["config"]; ok {
-			v, err := resolve(name, "config", cands)
+		// config 按键逐一裁决：未被高优先级来源触及的键保留低优先级取值；
+		// 同优先级来源设置互不相交的键时直接叠加，不算冲突。
+		ck := make([]string, 0, len(perConfigKey))
+		for k := range perConfigKey {
+			ck = append(ck, k)
+		}
+		sort.Strings(ck)
+		for _, k := range ck {
+			v, err := resolve(name, "config."+k, perConfigKey[k])
 			if err != nil {
 				return nil, err
 			}
-			for _, pair := range strings.Split(v, "\n") {
-				if pair == "" {
-					continue
-				}
-				k, val, _ := strings.Cut(pair, "=")
-				res.Config[k] = val
-			}
+			res.Config[k] = v
 		}
 		merged[name] = res
 	}

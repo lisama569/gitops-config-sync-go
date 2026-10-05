@@ -150,3 +150,56 @@ func keys(m map[string]state.Resource) []string {
 	}
 	return out
 }
+
+func TestApplyPrunesRemovedResources(t *testing.T) {
+	c := cluster.New(t.TempDir())
+	// 上一版期望态包含 db 与 cache。
+	v1 := desired("prod",
+		state.Resource{Name: "db", Replicas: 1},
+		state.Resource{Name: "cache", Replicas: 1},
+	)
+	if _, err := Apply(c, v1); err != nil {
+		t.Fatal(err)
+	}
+
+	// 新版期望态移除了 cache。
+	v2 := desired("prod", state.Resource{Name: "db", Replicas: 2})
+	t.Logf("输入: 观测态=[db cache], 新期望态=[db], cache 从期望态移除")
+	res, err := Apply(c, v2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("波次: %v 已应用: %v 已回收: %v", res.Waves, res.Applied, res.Pruned)
+	if len(res.Pruned) != 1 || res.Pruned[0] != "cache" {
+		t.Fatalf("cache 应被回收, got Pruned=%v", res.Pruned)
+	}
+	if _, ok, _ := c.Get("cache"); ok {
+		t.Fatal("期望态移除后, 观测态中的 cache 必须被清理")
+	}
+	if _, ok, _ := c.Get("db"); !ok {
+		t.Fatal("期望态保留的 db 不应被误删")
+	}
+}
+
+func TestApplyFailureKeepsPrunableResources(t *testing.T) {
+	c := cluster.New(t.TempDir())
+	v1 := desired("prod", state.Resource{Name: "db", Replicas: 1})
+	if _, err := Apply(c, v1); err != nil {
+		t.Fatal(err)
+	}
+	// 新版本移除 db、引入不健康的 web, 同步失败应回滚且 db 不被清理。
+	if err := c.SetHealthy("web", false); err != nil {
+		t.Fatal(err)
+	}
+	v2 := desired("prod", state.Resource{Name: "web", Replicas: 1})
+	t.Logf("输入: 观测态=[db], 新期望态=[web(不健康)]; db 待回收但同步将失败")
+	_, err := Apply(c, v2)
+	var fe *FailError
+	if !errors.As(err, &fe) {
+		t.Fatalf("应同步失败, got %v", err)
+	}
+	if _, ok, _ := c.Get("db"); !ok {
+		t.Fatal("同步失败回滚后, 待回收的 db 必须仍然存在")
+	}
+	t.Logf("同步失败已回滚: %v; db 保留, 未发生部分回收", fe)
+}

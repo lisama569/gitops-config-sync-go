@@ -31,10 +31,11 @@ func (e *FailError) Error() string {
 	return fmt.Sprintf("sync failed [%s] resource=%q: %s", e.Reason, e.Resource, e.Detail)
 }
 
-// Result 记录一次同步的波次与已应用资源。
+// Result 记录一次同步的波次、已应用资源与被回收资源。
 type Result struct {
 	Waves   [][]string
 	Applied []string
+	Pruned  []string // 观测态中存在但期望态已移除、本次被清理的资源
 }
 
 // Plan 将资源按依赖关系拓扑分波：同一波内无相互依赖，按名字排序保证可复现。
@@ -99,7 +100,9 @@ func Plan(resources []state.Resource) ([][]string, error) {
 
 // Apply 分波应用期望态：
 //   - 每波应用后对该波资源做健康检查，依赖未就绪/健康失败/写入出错都会失败；
-//   - 任一失败立即回滚到同步前快照，不留部分生效的中间态。
+//   - 任一失败立即回滚到同步前快照，不留部分生效的中间态；
+//   - 全部波次成功后，回收观测态中存在但期望态已不包含的资源（prune），
+//     不能因为期望态里没有就当作不存在。
 func Apply(c *cluster.Cluster, desired state.DesiredState) (Result, error) {
 	waves, err := Plan(desired.Resources)
 	if err != nil {
@@ -156,6 +159,22 @@ func Apply(c *cluster.Cluster, desired state.DesiredState) (Result, error) {
 				return rollback(&FailError{Reason: ReasonHealthCheckFailed, Resource: name, Detail: "post-apply health check failed"})
 			}
 		}
+	}
+
+	// 回收：观测态里存在、期望态已移除的资源在全部波次成功后清理。
+	// 放在最后执行，失败回滚路径不会走到这里，快照恢复语义不受影响。
+	var pruned []string
+	for name := range snapshot {
+		if _, keep := byName[name]; !keep {
+			pruned = append(pruned, name)
+		}
+	}
+	sort.Strings(pruned)
+	for _, name := range pruned {
+		if err := c.Remove(name); err != nil {
+			return rollback(&FailError{Reason: ReasonApplyFailed, Resource: name, Detail: "prune: " + err.Error()})
+		}
+		res.Pruned = append(res.Pruned, name)
 	}
 	return res, nil
 }
