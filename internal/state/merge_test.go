@@ -142,3 +142,100 @@ func TestRenderReproducible(t *testing.T) {
 		t.Fatalf("资源应按名称排序: %v", d1.Resources)
 	}
 }
+
+func TestMergeConfigKeyLevelOverlay(t *testing.T) {
+	dir := t.TempDir()
+	base := writeSource(t, dir, "base.json", `{"resources":{"db":{"config":{"image":"pg:15","mode":"rw","pool":"10"}}}}`)
+	overlay := writeSource(t, dir, "overlay.json", `{"resources":{"db":{"config":{"pool":"20"}}}}`)
+
+	lo, err := LoadSource(base, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hi, err := LoadSource(overlay, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("输入: base(prio=10).config=%v overlay(prio=20).config=%v", lo.Resources["db"], hi.Resources["db"])
+
+	merged, err := Merge([]Source{lo, hi})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := merged["db"].Config
+	t.Logf("合并结果 config: %v", cfg)
+	if cfg["pool"] != "20" {
+		t.Fatalf("高优先级来源设置的键应被覆盖, got %q", cfg["pool"])
+	}
+	if cfg["image"] != "pg:15" || cfg["mode"] != "rw" {
+		t.Fatalf("低优先级来源未被碰到的键应原样保留, got %v", cfg)
+	}
+}
+
+func TestMergeConfigSamePriorityDisjointKeys(t *testing.T) {
+	dir := t.TempDir()
+	a := writeSource(t, dir, "a.json", `{"resources":{"db":{"config":{"image":"pg:15"}}}}`)
+	b := writeSource(t, dir, "b.json", `{"resources":{"db":{"config":{"pool":"10"}}}}`)
+
+	sa, _ := LoadSource(a, 10)
+	sb, _ := LoadSource(b, 10) // 同优先级、互不相交的键
+	t.Logf("输入: a(prio=10).config={image} b(prio=10).config={pool} (键互不相交)")
+
+	merged, err := Merge([]Source{sa, sb})
+	if err != nil {
+		t.Fatalf("同优先级互不相交的键不应视为冲突: %v", err)
+	}
+	cfg := merged["db"].Config
+	if cfg["image"] != "pg:15" || cfg["pool"] != "10" {
+		t.Fatalf("两个来源的键都应保留, got %v", cfg)
+	}
+	t.Logf("合并结果 config: %v", cfg)
+}
+
+func TestMergeConfigSameKeyConflict(t *testing.T) {
+	dir := t.TempDir()
+	a := writeSource(t, dir, "a.json", `{"resources":{"db":{"config":{"pool":"10"}}}}`)
+	b := writeSource(t, dir, "b.json", `{"resources":{"db":{"config":{"pool":"20"}}}}`)
+
+	sa, _ := LoadSource(a, 10)
+	sb, _ := LoadSource(b, 10) // 同优先级、同一个键、不同值
+	t.Logf("输入: a(prio=10).config.pool=10 b(prio=10).config.pool=20")
+
+	_, err := Merge([]Source{sa, sb})
+	var rej *RejectError
+	if !errors.As(err, &rej) {
+		t.Fatalf("应返回 *RejectError, got %v", err)
+	}
+	if rej.Reason != ReasonConflictingOverride {
+		t.Fatalf("拒绝原因应为 %s, got %s", ReasonConflictingOverride, rej.Reason)
+	}
+	if rej.Field != "db.config.pool" {
+		t.Fatalf("冲突字段应定位到键, got %q", rej.Field)
+	}
+	t.Logf("键级冲突被拒绝(与来源缺失/类型非法可区分): %v", rej)
+}
+
+func TestMergeConfigKeyLevelRenderReproducible(t *testing.T) {
+	dir := t.TempDir()
+	base := writeSource(t, dir, "base.json", `{"resources":{"db":{"replicas":1,"config":{"image":"pg:15","mode":"rw"}}}}`)
+	overlay := writeSource(t, dir, "overlay.json", `{"resources":{"db":{"config":{"mode":"ro","pool":"20"}}}}`)
+	lo, _ := LoadSource(base, 10)
+	hi, _ := LoadSource(overlay, 20)
+
+	render := func() DesiredState {
+		merged, err := Merge([]Source{lo, hi})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ds, err := Render("prod", merged)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return ds
+	}
+	d1, d2 := render(), render()
+	t.Logf("键级合并渲染: hash1=%s hash2=%s config=%v", d1.Hash, d2.Hash, d1.Resources[0].Config)
+	if d1.Hash != d2.Hash {
+		t.Fatalf("同一环境反复渲染必须一致: %s != %s", d1.Hash, d2.Hash)
+	}
+}

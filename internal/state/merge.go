@@ -116,29 +116,17 @@ func canonicalField(src Source, resource, field string, raw any) (string, error)
 			return bad("replicas must be a non-negative integer")
 		}
 		return strconv.FormatInt(n, 10), nil
-	case "config":
-		obj, ok := raw.(map[string]any)
-		if !ok {
-			return bad("config must be an object of string values")
-		}
-		pairs := make([]string, 0, len(obj))
-		for k, v := range obj {
-			s, ok := v.(string)
-			if !ok {
-				return bad(fmt.Sprintf("config.%s must be a string", k))
-			}
-			pairs = append(pairs, k+"="+s)
-		}
-		sort.Strings(pairs)
-		return strings.Join(pairs, "\n"), nil
 	default:
 		return bad("unknown field " + strconv.Quote(field))
 	}
 }
 
 // Merge 按优先级合并多个来源。
-// 同一字段被同优先级来源赋予不同值时返回 *RejectError{Reason: ReasonConflictingOverride}；
-// 字段类型不合法时返回 *RejectError{Reason: ReasonInvalidFieldType}。
+// 标量字段（replicas/dependsOn）按整字段解析；config 按**键**为最小单位叠加：
+// 高优先级来源只覆盖它显式设置的键，低优先级来源未被碰到的键原样保留。
+// 同一字段/同一 config 键被同优先级来源赋予不同值时返回
+// *RejectError{Reason: ReasonConflictingOverride}；同优先级来源设置互不相交的
+// config 键不算冲突。字段类型不合法时返回 *RejectError{Reason: ReasonInvalidFieldType}。
 func Merge(sources []Source) (map[string]Resource, error) {
 	names := map[string]struct{}{}
 	for _, src := range sources {
@@ -154,8 +142,9 @@ func Merge(sources []Source) (map[string]Resource, error) {
 
 	merged := make(map[string]Resource, len(sorted))
 	for _, name := range sorted {
-		// 按字段收集各来源候选值。
+		// 按字段收集各来源候选值；config 额外按键收集。
 		perField := map[string][]candidate{}
+		perConfigKey := map[string][]candidate{}
 		for _, src := range sources {
 			raw, ok := src.Resources[name]
 			if !ok {
@@ -167,6 +156,39 @@ func Merge(sources []Source) (map[string]Resource, error) {
 			}
 			sort.Strings(keys)
 			for _, field := range keys {
+				if field == "config" {
+					obj, ok := raw[field].(map[string]any)
+					if !ok {
+						return nil, &RejectError{
+							Reason: ReasonInvalidFieldType,
+							Source: src.Name,
+							Field:  name + ".config",
+							Detail: "config must be an object of string values",
+						}
+					}
+					ck := make([]string, 0, len(obj))
+					for k := range obj {
+						ck = append(ck, k)
+					}
+					sort.Strings(ck)
+					for _, k := range ck {
+						s, ok := obj[k].(string)
+						if !ok {
+							return nil, &RejectError{
+								Reason: ReasonInvalidFieldType,
+								Source: src.Name,
+								Field:  name + ".config." + k,
+								Detail: "config value must be a string",
+							}
+						}
+						perConfigKey[k] = append(perConfigKey[k], candidate{
+							canonical: s,
+							source:    src.Name,
+							priority:  src.Priority,
+						})
+					}
+					continue
+				}
 				canon, err := canonicalField(src, name, field, raw[field])
 				if err != nil {
 					return nil, err
@@ -197,18 +219,18 @@ func Merge(sources []Source) (map[string]Resource, error) {
 			n, _ := strconv.Atoi(v)
 			res.Replicas = n
 		}
-		if cands, ok := perField["config"]; ok {
-			v, err := resolve(name, "config", cands)
+		// config 逐键解析：只有同一个键被同优先级来源赋不同值才冲突。
+		ckeys := make([]string, 0, len(perConfigKey))
+		for k := range perConfigKey {
+			ckeys = append(ckeys, k)
+		}
+		sort.Strings(ckeys)
+		for _, k := range ckeys {
+			v, err := resolve(name, "config."+k, perConfigKey[k])
 			if err != nil {
 				return nil, err
 			}
-			for _, pair := range strings.Split(v, "\n") {
-				if pair == "" {
-					continue
-				}
-				k, val, _ := strings.Cut(pair, "=")
-				res.Config[k] = val
-			}
+			res.Config[k] = v
 		}
 		merged[name] = res
 	}

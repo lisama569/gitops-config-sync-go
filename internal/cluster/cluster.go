@@ -95,6 +95,26 @@ func (c *Cluster) Remove(name string) error {
 
 func isNotExist() error { return fs.ErrNotExist }
 
+// List 返回集群中观测到的全部资源名（排序后，可复现）。
+func (c *Cluster) List() ([]string, error) {
+	entries, err := os.ReadDir(c.resourcesDir())
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	names := []string{}
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
+			continue
+		}
+		names = append(names, strings.TrimSuffix(e.Name(), ".json"))
+	}
+	sort.Strings(names)
+	return names, nil
+}
+
 // Healthy 检查资源健康状态：health/<name> 文件内容为 "false" 时不健康，缺省健康。
 func (c *Cluster) Healthy(name string) (bool, error) {
 	data, err := os.ReadFile(filepath.Join(c.healthDir(), name))

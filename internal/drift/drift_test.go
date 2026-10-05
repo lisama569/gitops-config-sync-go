@@ -69,3 +69,31 @@ func TestDetectNoDrift(t *testing.T) {
 		t.Fatalf("一致时不应有漂移: %+v", rep.Entries)
 	}
 }
+
+func TestDetectExtra(t *testing.T) {
+	c := cluster.New(t.TempDir())
+	want := state.Resource{Name: "db", Replicas: 1, Config: map[string]string{}}
+	if err := c.Apply(want); err != nil {
+		t.Fatal(err)
+	}
+	// 观测态中多出一个期望态完全没有的资源。
+	stray := state.Resource{Name: "stray", Replicas: 1, Config: map[string]string{"k": "v"}}
+	if err := c.Apply(stray); err != nil {
+		t.Fatal(err)
+	}
+
+	ds, _ := state.Render("prod", map[string]state.Resource{"db": want})
+	rep, err := Detect(c, ds)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rep.HasDrift() || len(rep.Entries) != 1 {
+		t.Fatalf("多出的资源应被识别为漂移: %+v", rep.Entries)
+	}
+	e := rep.Entries[0]
+	t.Logf("漂移判定依据: resource=%s kind=%s expected=%s observed=%s",
+		e.Resource, e.Kind, e.Expected, e.Observed)
+	if e.Kind != "Extra" || e.Resource != "stray" || e.Expected != "-" {
+		t.Fatalf("Extra 漂移条目不符: %+v", e)
+	}
+}
